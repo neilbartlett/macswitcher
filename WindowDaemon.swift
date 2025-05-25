@@ -16,7 +16,7 @@ struct WindowData: Codable {
 }
 
 class WindowInfo {
-    let windowRef: AXUIElement
+    var windowRef: AXUIElement
     let pid: pid_t
     let appName: String
     var title: String
@@ -66,6 +66,12 @@ class WindowDaemon {
     private var isRunning = true
     private let socketPath = "/tmp/windowdaemon.sock"
     
+    // Helper function to ensure output is flushed
+    private func logMessage(_ message: String) {
+        print(message)
+        fflush(stdout)
+    }
+    
     init() {
         setupAccessibilityPermissions()
         cleanupSocket()
@@ -84,7 +90,7 @@ class WindowDaemon {
         ] as CFDictionary)
         
         if !trusted {
-            print("Please grant accessibility permissions in System Preferences > Security & Privacy > Privacy > Accessibility")
+            logMessage("Please grant accessibility permissions in System Preferences > Security & Privacy > Privacy > Accessibility")
         }
     }
     
@@ -96,7 +102,7 @@ class WindowDaemon {
     
     private func performWindowScan() {
         guard AXIsProcessTrusted() else {
-            print("⚠️  Accessibility permissions not granted.")
+            logMessage("⚠️  Accessibility permissions not granted.")
             return
         }
         
@@ -121,7 +127,7 @@ class WindowDaemon {
                 continue
             }
             
-            for (index, axWindow) in axWindows.enumerated() {
+            for (_, axWindow) in axWindows.enumerated() {
                 var titleValue: AnyObject?
                 let titleResult = AXUIElementCopyAttributeValue(axWindow, kAXTitleAttribute as CFString, &titleValue)
                 
@@ -135,8 +141,8 @@ class WindowDaemon {
                     continue
                 }
                 
-                // Create a simpler, more reliable window ID
-                let windowID = "\(pid)_\(index)"
+                let titleHash = abs(title.hashValue) % 10000
+                let windowID = "\(pid)_\(titleHash)_\(title.prefix(10))"
                 
                 let windowInfo = WindowInfo(
                     windowRef: axWindow,
@@ -156,7 +162,7 @@ class WindowDaemon {
             self?.windows = newWindows
             // Only print on initial scan or significant changes
             if windowCount != previousCount {
-                print("✅ Loaded \(windowCount) windows")
+                self?.logMessage("✅ Loaded \(windowCount) windows")
             }
         }
     }
@@ -177,19 +183,39 @@ class WindowDaemon {
     private func setupEventObservers() {
         let workspace = NSWorkspace.shared
         
+        // App activation - scan for new windows when apps become active
         workspace.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification,
             object: nil,
             queue: .main
-        ) { [weak self] _ in
-            self?.updateActiveWindow()
+        ) { [weak self] notification in
+            self?.handleAppActivation(notification)
         }
         
-        // Periodic refresh - much less frequent and store reference
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { [weak self] _ in
-            guard let self = self, self.isRunning else { return }
-            self.refreshWindows()
+        // App launch - scan when new apps start
+        workspace.notificationCenter.addObserver(
+            forName: NSWorkspace.didLaunchApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            self?.handleAppLaunch(notification)
         }
+        
+        // App termination - clean up windows
+        workspace.notificationCenter.addObserver(
+            forName: NSWorkspace.didTerminateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            self?.handleAppTermination(notification)
+        }
+        
+        // Remove periodic refresh for now to focus on event handling
+        // refreshTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+        //     guard let self = self, self.isRunning else { return }
+        //     self.logMessage("⏰ Periodic refresh triggered")
+        //     self.refreshWindows()
+        // }
     }
     
     private func updateActiveWindow() {
@@ -208,6 +234,162 @@ class WindowDaemon {
     private func refreshWindows() {
         queue.async { [weak self] in
             self?.performWindowScan()
+        }
+    }
+    
+    private func handleAppActivation(_ notification: Notification) {
+        guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else {
+            return
+        }
+        
+        guard let appName = app.localizedName else { return }
+        logMessage("🔄 App activated: \(appName)")
+        
+        // Update last used time for windows of this app
+        updateActiveWindow()
+        
+        // Quick scan for new windows in this app
+        queue.async { [weak self] in
+            self?.scanAppWindows(app)
+        }
+    }
+    
+    private func handleAppLaunch(_ notification: Notification) {
+        guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else {
+            return
+        }
+        
+        guard let appName = app.localizedName else { return }
+        logMessage("🚀 App launched: \(appName)")
+        
+        // Give the app a moment to create its windows
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.queue.async {
+                self?.scanAppWindows(app)
+            }
+        }
+    }
+    
+    private func handleAppTermination(_ notification: Notification) {
+        guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else {
+            return
+        }
+        
+        // Remove windows for terminated app
+        let pid = app.processIdentifier
+        DispatchQueue.main.async { [weak self] in
+            let removedCount = self?.windows.count ?? 0
+            self?.windows = self?.windows.filter { $0.value.pid != pid } ?? [:]
+            let newCount = self?.windows.count ?? 0
+            
+            if removedCount != newCount {
+                self?.logMessage("🗑️ Removed \(removedCount - newCount) windows from terminated app: \(app.localizedName ?? "Unknown")")
+            }
+        }
+    }
+    
+    private func scanAppWindows(_ app: NSRunningApplication) {
+        guard let appName = app.localizedName else { return }
+        let pid = app.processIdentifier
+        
+        if shouldSkipApp(appName: appName) {
+            logMessage("⏭️ Skipping app: \(appName)")
+            return
+        }
+        
+        logMessage("🔍 Scanning \(appName) (PID: \(pid)) for new windows...")
+        
+        let appRef = AXUIElementCreateApplication(pid)
+        var value: AnyObject?
+        guard AXUIElementCopyAttributeValue(appRef, kAXWindowsAttribute as CFString, &value) == .success,
+              let axWindows = value as? [AXUIElement] else {
+            logMessage("⚠️ Could not get windows for \(appName) - accessibility issue?")
+            return
+        }
+        
+        logMessage("📊 \(appName) reports \(axWindows.count) total AX windows")
+        
+        // Get current windows for this app to see what we already have
+        let existingWindowsForApp = windows.values.filter { $0.pid == pid }
+        logMessage("📋 We already know about \(existingWindowsForApp.count) windows for \(appName):")
+        for existingWindow in existingWindowsForApp {
+            logMessage("  - Existing: '\(existingWindow.title)' (ID: \(existingWindow.windowID))")
+        }
+        
+        var newWindowsFound = 0
+        var processedWindows: [String] = []
+        
+        for (index, axWindow) in axWindows.enumerated() {
+            var titleValue: AnyObject?
+            guard AXUIElementCopyAttributeValue(axWindow, kAXTitleAttribute as CFString, &titleValue) == .success,
+                  let title = titleValue as? String,
+                  !title.isEmpty else {
+                logMessage("  Window \(index): no title or empty - skipping")
+                continue
+            }
+            
+            if shouldSkipWindow(appName: appName, title: title) {
+                logMessage("  Window \(index): '\(title)' - SKIPPED by filter")
+                continue
+            }
+            
+            // Use same ID generation as initial scan
+            let titleHash = abs(title.hashValue) % 10000
+            let windowID = "\(pid)_\(titleHash)_\(title.prefix(10))"
+            processedWindows.append(windowID)
+            
+            logMessage("  Window \(index): '\(title)' -> ID: \(windowID)")
+            
+            // Check if we already have this window
+            if windows[windowID] == nil {
+                let windowInfo = WindowInfo(
+                    windowRef: axWindow,
+                    pid: pid,
+                    appName: appName,
+                    title: title,
+                    windowID: windowID
+                )
+                
+                DispatchQueue.main.async { [weak self] in
+                    self?.windows[windowID] = windowInfo
+                    self?.logMessage("  ➕ NEW window added to collection: '\(title)'")
+                }
+                newWindowsFound += 1
+            } else {
+                logMessage("  ✓ Already exists in collection")
+                // Update the AX reference in case it changed
+                DispatchQueue.main.async { [weak self] in
+                    self?.windows[windowID]?.windowRef = axWindow
+                    self?.windows[windowID]?.title = title
+                }
+            }
+        }
+        
+        // Clean up any windows for this app that no longer exist
+        let windowsToRemove = existingWindowsForApp.filter { existingWindow in
+            !processedWindows.contains(existingWindow.windowID)
+        }
+        
+        if !windowsToRemove.isEmpty {
+            logMessage("🗑️ Found \(windowsToRemove.count) windows to remove:")
+            for windowToRemove in windowsToRemove {
+                logMessage("  - Removing: '\(windowToRemove.title)' (ID: \(windowToRemove.windowID))")
+            }
+            DispatchQueue.main.async { [weak self] in
+                for windowToRemove in windowsToRemove {
+                    self?.windows.removeValue(forKey: windowToRemove.windowID)
+                }
+                self?.logMessage("🗑️ Cleanup complete - removed \(windowsToRemove.count) windows from \(appName)")
+            }
+        }
+        
+        DispatchQueue.main.async { [weak self] in
+            let totalWindows = self?.windows.count ?? 0
+            if newWindowsFound > 0 {
+                self?.logMessage("✅ \(appName) scan complete: +\(newWindowsFound) new windows (total collection: \(totalWindows))")
+            } else {
+                self?.logMessage("✅ \(appName) scan complete: no new windows found (total collection: \(totalWindows))")
+            }
         }
     }
     
@@ -246,7 +428,7 @@ class WindowDaemon {
             return
         }
         
-        print("🚀 Window daemon listening on \(socketPath)")
+        logMessage("🚀 Window daemon listening on \(socketPath)")
         
         while isRunning {
             let clientSocket = accept(serverSocket, nil, nil)
@@ -284,6 +466,7 @@ class WindowDaemon {
             let windowID = parts.count > 1 ? parts[1] : ""
             response = handleFocusCommand(windowID: windowID)
         case .refresh:
+            logMessage("🔄 Manual refresh requested")
             refreshWindows()
             response = DaemonResponse(success: true, message: "Refreshing windows...", windows: nil)
         case .quit:
@@ -363,7 +546,7 @@ class WindowDaemon {
     }
     
     private func shutdown() {
-        print("🛑 Shutting down daemon...")
+        logMessage("🛑 Shutting down daemon...")
         isRunning = false
         
         // Stop the refresh timer
@@ -450,4 +633,3 @@ if CommandLine.argc == 1 {
     
     exit(response.success ? 0 : 1)
 }
-
