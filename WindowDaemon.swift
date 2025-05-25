@@ -244,14 +244,11 @@ class WindowDaemon {
             return
         }
         
-        guard let appName = app.localizedName else { return }
-        logMessage("🔄 App activated: \(appName) - about to queue scan")
-        
+        guard let _ = app.localizedName else { return }
         // Update last used time for windows of this app
         updateActiveWindow()
         
-        // Try synchronous scan first to debug
-        logMessage("🔄 Doing SYNCHRONOUS scan for \(appName)")
+        // Quick scan for new windows in this app
         scanAppWindows(app)
     }
     
@@ -260,12 +257,9 @@ class WindowDaemon {
             return
         }
         
-        guard let appName = app.localizedName else { return }
-        logMessage("🚀 App launched: \(appName) - scheduling scan")
-        
-        // Give the app a moment to create its windows, then do synchronous scan
+        guard let _ = app.localizedName else { return }
+        // Give the app a moment to create its windows
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-            self?.logMessage("🚀 Delayed SYNCHRONOUS scan starting for \(appName)")
             self?.scanAppWindows(app)
         }
     }
@@ -290,63 +284,45 @@ class WindowDaemon {
     
     private func scanAppWindows(_ app: NSRunningApplication) {
         guard let appName = app.localizedName else { 
-            logMessage("❌ scanAppWindows: No app name")
             return 
         }
         let pid = app.processIdentifier
         
-        logMessage("🔍 scanAppWindows CALLED for \(appName) (PID: \(pid))")
-        
         if shouldSkipApp(appName: appName) {
-            logMessage("⏭️ Skipping app: \(appName)")
             return
         }
-        
-        logMessage("🔍 Scanning \(appName) (PID: \(pid)) for new windows...")
         
         let appRef = AXUIElementCreateApplication(pid)
         var value: AnyObject?
         let result = AXUIElementCopyAttributeValue(appRef, kAXWindowsAttribute as CFString, &value)
         
-        logMessage("🔍 AXUIElementCopyAttributeValue result: \(result.rawValue)")
-        
         guard result == .success, let axWindows = value as? [AXUIElement] else {
+            if result.rawValue == -25204 {
+                // App not ready yet, this is normal on launch
+                return
+            }
             logMessage("⚠️ Could not get windows for \(appName) - result: \(result.rawValue)")
             return
         }
         
-        logMessage("📊 \(appName) reports \(axWindows.count) total AX windows")
-        
-        // Get current windows for this app to see what we already have
+        // Get current windows for this app
         let existingWindowsForApp = windows.values.filter { $0.pid == pid }
-        logMessage("📋 We already know about \(existingWindowsForApp.count) windows for \(appName):")
-        for existingWindow in existingWindowsForApp {
-            logMessage("  - Existing: '\(existingWindow.title)' (ID: \(existingWindow.windowID))")
-        }
         
         var newWindowsFound = 0
         var processedWindows: [String] = []
         
-        for (index, axWindow) in axWindows.enumerated() {
+        for (_, axWindow) in axWindows.enumerated() {
             var titleValue: AnyObject?
             guard AXUIElementCopyAttributeValue(axWindow, kAXTitleAttribute as CFString, &titleValue) == .success,
                   let title = titleValue as? String,
-                  !title.isEmpty else {
-                logMessage("  Window \(index): no title or empty - skipping")
+                  !title.isEmpty,
+                  !shouldSkipWindow(appName: appName, title: title) else {
                 continue
             }
             
-            if shouldSkipWindow(appName: appName, title: title) {
-                logMessage("  Window \(index): '\(title)' - SKIPPED by filter")
-                continue
-            }
-            
-            // Use same ID generation as initial scan
             let titleHash = abs(title.hashValue) % 10000
             let windowID = "\(pid)_\(titleHash)_\(title.prefix(10))"
             processedWindows.append(windowID)
-            
-            logMessage("  Window \(index): '\(title)' -> ID: \(windowID)")
             
             // Check if we already have this window
             if windows[windowID] == nil {
@@ -360,11 +336,9 @@ class WindowDaemon {
                 
                 DispatchQueue.main.async { [weak self] in
                     self?.windows[windowID] = windowInfo
-                    self?.logMessage("  ➕ NEW window added to collection: '\(title)'")
                 }
                 newWindowsFound += 1
             } else {
-                logMessage("  ✓ Already exists in collection")
                 // Update the AX reference in case it changed
                 DispatchQueue.main.async { [weak self] in
                     self?.windows[windowID]?.windowRef = axWindow
@@ -379,24 +353,17 @@ class WindowDaemon {
         }
         
         if !windowsToRemove.isEmpty {
-            logMessage("🗑️ Found \(windowsToRemove.count) windows to remove:")
-            for windowToRemove in windowsToRemove {
-                logMessage("  - Removing: '\(windowToRemove.title)' (ID: \(windowToRemove.windowID))")
-            }
             DispatchQueue.main.async { [weak self] in
                 for windowToRemove in windowsToRemove {
                     self?.windows.removeValue(forKey: windowToRemove.windowID)
                 }
-                self?.logMessage("🗑️ Cleanup complete - removed \(windowsToRemove.count) windows from \(appName)")
+                self?.logMessage("🗑️ Removed \(windowsToRemove.count) closed windows from \(appName)")
             }
         }
         
-        DispatchQueue.main.async { [weak self] in
-            let totalWindows = self?.windows.count ?? 0
-            if newWindowsFound > 0 {
-                self?.logMessage("✅ \(appName) scan complete: +\(newWindowsFound) new windows (total collection: \(totalWindows))")
-            } else {
-                self?.logMessage("✅ \(appName) scan complete: no new windows found (total collection: \(totalWindows))")
+        if newWindowsFound > 0 {
+            DispatchQueue.main.async { [weak self] in
+                self?.logMessage("➕ Found \(newWindowsFound) new windows in \(appName)")
             }
         }
     }
@@ -508,13 +475,18 @@ class WindowDaemon {
     
     private func handleFocusCommand(windowID: String) -> DaemonResponse {
         guard let windowInfo = windows[windowID] else {
-            return DaemonResponse(success: false, message: "Window not found: \(windowID)", windows: nil)
+            return DaemonResponse(success: false, message: "Window no longer exists: \(windowID)", windows: nil)
         }
         
         // First, activate the application
         let runningApps = NSWorkspace.shared.runningApplications
         guard let app = runningApps.first(where: { $0.processIdentifier == windowInfo.pid }) else {
-            return DaemonResponse(success: false, message: "Application not found", windows: nil)
+            // App is gone, remove this window from our list
+            DispatchQueue.main.async { [weak self] in
+                self?.windows.removeValue(forKey: windowID)
+                self?.logMessage("🗑️ Removed stale window reference for terminated app")
+            }
+            return DaemonResponse(success: false, message: "Application no longer exists", windows: nil)
         }
         
         app.activate()
@@ -522,34 +494,37 @@ class WindowDaemon {
         // Give the app a moment to activate
         usleep(100000) // 0.1 seconds
         
-        // Try multiple approaches to focus the window
-        var success = false
-        
-        // Method 1: AXRaise (bring window to front)
+        // Try to focus the window, but handle case where window is stale
         let raiseResult = AXUIElementPerformAction(windowInfo.windowRef, kAXRaiseAction as CFString)
+        
         if raiseResult == .success {
-            success = true
-        }
-        
-        // Method 2: Check if window is minimized and try to unminimize
-        if !success {
-            var minimizedValue: AnyObject?
-            let minimizedResult = AXUIElementCopyAttributeValue(windowInfo.windowRef, kAXMinimizedAttribute as CFString, &minimizedValue)
-            if minimizedResult == .success, let isMinimized = minimizedValue as? Bool, isMinimized {
-                let setResult = AXUIElementSetAttributeValue(windowInfo.windowRef, kAXMinimizedAttribute as CFString, false as CFBoolean)
-                if setResult == .success {
-                    // Try raising again after unminimizing
-                    let raiseAfterUnminimize = AXUIElementPerformAction(windowInfo.windowRef, kAXRaiseAction as CFString)
-                    success = (raiseAfterUnminimize == .success)
-                }
-            }
-        }
-        
-        if success {
             windowInfo.lastUsed = Date()
             return DaemonResponse(success: true, message: "Focused window: \(windowInfo.title)", windows: nil)
         } else {
-            return DaemonResponse(success: false, message: "Failed to focus window", windows: nil)
+            // Window reference is stale, try to find it again
+            logMessage("⚠️ Stale window reference for '\(windowInfo.title)', attempting to refresh")
+            
+            // Try to re-scan this app to get fresh window references
+            scanAppWindows(app)
+            
+            // Check if we found the window again (by title)
+            let refreshedWindow = windows.values.first { $0.pid == windowInfo.pid && $0.title == windowInfo.title }
+            
+            if let refreshedWindow = refreshedWindow {
+                let retryResult = AXUIElementPerformAction(refreshedWindow.windowRef, kAXRaiseAction as CFString)
+                if retryResult == .success {
+                    refreshedWindow.lastUsed = Date()
+                    return DaemonResponse(success: true, message: "Focused window after refresh: \(refreshedWindow.title)", windows: nil)
+                }
+            }
+            
+            // Remove the stale reference
+            DispatchQueue.main.async { [weak self] in
+                self?.windows.removeValue(forKey: windowID)
+                self?.logMessage("🗑️ Removed stale window reference: '\(windowInfo.title)'")
+            }
+            
+            return DaemonResponse(success: false, message: "Window '\(windowInfo.title)' no longer exists", windows: nil)
         }
     }
     
