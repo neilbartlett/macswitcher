@@ -1,0 +1,238 @@
+#!/bin/bash
+
+# Window Switcher - Clean fzf frontend for WindowDaemon
+
+DAEMON_PATH="./windowdaemon"
+SOCKET_PATH="/tmp/windowdaemon.sock"
+PID_FILE="/tmp/windowdaemon.pid"
+LOG_FILE="/tmp/windowdaemon.log"
+
+# Utility functions
+daemon_running() {
+    [ -S "$SOCKET_PATH" ]
+}
+
+extract_window_id() {
+    echo "$1" | cut -d$'\t' -f1
+}
+
+extract_window_title() {
+    echo "$1" | cut -d$'\t' -f2-
+}
+
+get_windows() {
+    $DAEMON_PATH list 2>/dev/null
+}
+
+focus_window() {
+    local window_id="$1"
+    local result
+    result=$($DAEMON_PATH focus "$window_id" 2>&1)
+    [[ $? -eq 0 ]] || { echo "Error: $result" >&2; return 1; }
+}
+
+ensure_daemon() {
+    daemon_running || start_daemon
+}
+
+# Daemon management
+start_daemon() {
+    if daemon_running; then
+        echo "Daemon already running"
+        return 0
+    fi
+    
+    echo "Starting window daemon..."
+    nohup $DAEMON_PATH > "$LOG_FILE" 2>&1 &
+    echo $! > "$PID_FILE"
+    
+    # Wait for socket
+    local count=0
+    while ! daemon_running && [ $count -lt 10 ]; do
+        sleep 0.5
+        count=$((count + 1))
+    done
+    
+    daemon_running || { echo "Failed to start daemon"; return 1; }
+    echo "Daemon started successfully"
+}
+
+stop_daemon() {
+    if ! daemon_running; then
+        echo "Daemon not running"
+        return 0
+    fi
+    
+    echo "Stopping daemon..."
+    
+    # Send quit command
+    $DAEMON_PATH quit 2>/dev/null &
+    local quit_pid=$!
+    
+    # Wait for graceful shutdown
+    local count=0
+    while daemon_running && [ $count -lt 10 ]; do
+        sleep 0.2
+        count=$((count + 1))
+    done
+    
+    # If still running, force kill
+    if daemon_running; then
+        echo "Force stopping daemon..."
+        if [ -f "$PID_FILE" ]; then
+            local pid=$(cat "$PID_FILE" 2>/dev/null)
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                kill -TERM "$pid" 2>/dev/null
+                sleep 1
+                kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+            fi
+        fi
+        
+        # Also kill any windowdaemon processes
+        pkill -f "windowdaemon" 2>/dev/null
+    fi
+    
+    # Clean up files
+    rm -f "$SOCKET_PATH" "$PID_FILE"
+    echo "Daemon stopped"
+}
+
+# Core functionality
+switch_window_interactive() {
+    ensure_daemon
+    
+    local windows
+    windows=$(get_windows)
+    [ -n "$windows" ] || { echo "No windows found"; return 1; }
+    
+    local selected
+    selected=$(echo "$windows" | fzf \
+        --height=40% \
+        --layout=reverse \
+        --border \
+        --prompt="Switch to: " \
+        --preview-window=hidden \
+        --bind="ctrl-r:reload($DAEMON_PATH refresh && $DAEMON_PATH list)" \
+        --header="Ctrl-R: refresh, ESC: cancel")
+    
+    if [ -n "$selected" ]; then
+        local window_id window_title
+        window_id=$(extract_window_id "$selected")
+        window_title=$(extract_window_title "$selected")
+        
+        if focus_window "$window_id"; then
+            echo "Switched to: $window_title"
+        else
+            echo "Failed to switch to window"
+            return 1
+        fi
+    fi
+}
+
+search_and_switch() {
+    local query="$1"
+    ensure_daemon
+    
+    local windows filtered
+    windows=$(get_windows)
+    [ -n "$windows" ] || { echo "No windows found"; return 1; }
+    
+    filtered=$(echo "$windows" | grep -i "$query")
+    [ -n "$filtered" ] || { echo "No windows match: $query"; return 1; }
+    
+    local count
+    count=$(echo "$filtered" | wc -l)
+    
+    if [ "$count" -eq 1 ]; then
+        # Single match - switch directly
+        local window_id window_title
+        window_id=$(extract_window_id "$filtered")
+        window_title=$(extract_window_title "$filtered")
+        
+        if focus_window "$window_id"; then
+            echo "Switched to: $window_title"
+        else
+            return 1
+        fi
+    else
+        # Multiple matches - use fzf
+        local selected
+        selected=$(echo "$filtered" | fzf \
+            --height=20% \
+            --layout=reverse \
+            --border \
+            --prompt="Select: " \
+            --query="$query")
+        
+        if [ -n "$selected" ]; then
+            local window_id window_title
+            window_id=$(extract_window_id "$selected")
+            window_title=$(extract_window_title "$selected")
+            
+            if focus_window "$window_id"; then
+                echo "Switched to: $window_title"
+            else
+                return 1
+            fi
+        fi
+    fi
+}
+
+list_windows() {
+    ensure_daemon
+    get_windows | extract_window_title | head -10
+}
+
+debug_info() {
+    echo "=== Window Daemon Debug ==="
+    echo "Socket: $SOCKET_PATH $(daemon_running && echo "(exists)" || echo "(missing)")"
+    echo "PID file: $PID_FILE"
+    echo "Log file: $LOG_FILE"
+    echo
+    
+    if daemon_running; then
+        echo "Sample windows:"
+        get_windows | head -3 | while IFS=$'\t' read -r id title; do
+            echo "  ID: '$id' | Title: '$title'"
+        done
+    else
+        echo "Daemon not running"
+    fi
+}
+
+show_help() {
+    cat << EOF
+Window Switcher - Fast keyboard-driven window management
+
+Usage:
+    wswitch                    Interactive window switcher
+    wswitch search <query>     Search and switch to window
+    wswitch list               List recent windows  
+    wswitch debug              Show debug information
+    wswitch start              Start daemon
+    wswitch stop               Stop daemon
+    wswitch help               Show this help
+
+Interactive mode keys:
+    Enter          Switch to window
+    Ctrl-R         Refresh window list
+    ESC            Cancel
+
+Examples:
+    wswitch search code        # Switch to window containing "code"
+    wswitch search safari      # Switch to Safari window
+EOF
+}
+
+# Main command dispatch
+case "${1:-switch}" in
+    "switch"|"")      switch_window_interactive ;;
+    "search")         [ -n "$2" ] && search_and_switch "$2" || { echo "Usage: wswitch search <query>"; exit 1; } ;;
+    "list")           list_windows ;;
+    "debug")          debug_info ;;
+    "start")          start_daemon ;;
+    "stop")           stop_daemon ;;
+    "help"|"-h")      show_help ;;
+    *)                echo "Unknown command: $1"; show_help; exit 1 ;;
+esac
+
