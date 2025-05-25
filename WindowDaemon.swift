@@ -232,7 +232,9 @@ class WindowDaemon {
     }
     
     private func refreshWindows() {
+        logMessage("🔄 refreshWindows called - testing queue")
         queue.async { [weak self] in
+            self?.logMessage("🔄 Queue is working - calling performWindowScan")
             self?.performWindowScan()
         }
     }
@@ -243,15 +245,14 @@ class WindowDaemon {
         }
         
         guard let appName = app.localizedName else { return }
-        logMessage("🔄 App activated: \(appName)")
+        logMessage("🔄 App activated: \(appName) - about to queue scan")
         
         // Update last used time for windows of this app
         updateActiveWindow()
         
-        // Quick scan for new windows in this app
-        queue.async { [weak self] in
-            self?.scanAppWindows(app)
-        }
+        // Try synchronous scan first to debug
+        logMessage("🔄 Doing SYNCHRONOUS scan for \(appName)")
+        scanAppWindows(app)
     }
     
     private func handleAppLaunch(_ notification: Notification) {
@@ -260,13 +261,12 @@ class WindowDaemon {
         }
         
         guard let appName = app.localizedName else { return }
-        logMessage("🚀 App launched: \(appName)")
+        logMessage("🚀 App launched: \(appName) - scheduling scan")
         
-        // Give the app a moment to create its windows
+        // Give the app a moment to create its windows, then do synchronous scan
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-            self?.queue.async {
-                self?.scanAppWindows(app)
-            }
+            self?.logMessage("🚀 Delayed SYNCHRONOUS scan starting for \(appName)")
+            self?.scanAppWindows(app)
         }
     }
     
@@ -289,8 +289,13 @@ class WindowDaemon {
     }
     
     private func scanAppWindows(_ app: NSRunningApplication) {
-        guard let appName = app.localizedName else { return }
+        guard let appName = app.localizedName else { 
+            logMessage("❌ scanAppWindows: No app name")
+            return 
+        }
         let pid = app.processIdentifier
+        
+        logMessage("🔍 scanAppWindows CALLED for \(appName) (PID: \(pid))")
         
         if shouldSkipApp(appName: appName) {
             logMessage("⏭️ Skipping app: \(appName)")
@@ -301,9 +306,12 @@ class WindowDaemon {
         
         let appRef = AXUIElementCreateApplication(pid)
         var value: AnyObject?
-        guard AXUIElementCopyAttributeValue(appRef, kAXWindowsAttribute as CFString, &value) == .success,
-              let axWindows = value as? [AXUIElement] else {
-            logMessage("⚠️ Could not get windows for \(appName) - accessibility issue?")
+        let result = AXUIElementCopyAttributeValue(appRef, kAXWindowsAttribute as CFString, &value)
+        
+        logMessage("🔍 AXUIElementCopyAttributeValue result: \(result.rawValue)")
+        
+        guard result == .success, let axWindows = value as? [AXUIElement] else {
+            logMessage("⚠️ Could not get windows for \(appName) - result: \(result.rawValue)")
             return
         }
         
